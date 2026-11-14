@@ -685,6 +685,22 @@ if not climate_annual.empty:
     latest_rainfall = rainfall_data.iloc[-1] if not rainfall_data.empty else None
     latest_humidity = humidity_data.iloc[-1] if not humidity_data.empty else None
 
+    # Calculate long-term trends when enough annual observations exist.
+    rainfall_trend = None
+    humidity_trend = None
+
+    if len(rainfall_data) >= 5:
+        rainfall_trend = calculate_trend(
+            rainfall_data["year"].to_numpy(dtype=np.float64),
+            rainfall_data["annual_rainfall"].to_numpy(dtype=np.float64),
+        )
+
+    if len(humidity_data) >= 5:
+        humidity_trend = calculate_trend(
+            humidity_data["year"].to_numpy(dtype=np.float64),
+            humidity_data["annual_humidity"].to_numpy(dtype=np.float64),
+        )
+
     r1, r2 = st.columns(2)
 
     with r1:
@@ -707,6 +723,71 @@ if not climate_annual.empty:
         else:
             st.info("No annual humidity estimate is available.")
 
+    st.subheader("Long-term climate trends")
+
+    t1, t2 = st.columns(2)
+
+    with t1:
+        if rainfall_trend is not None:
+            slope, _, _, tau, pvalue = rainfall_trend
+
+            direction = (
+                "Increasing"
+                if slope > 0
+                else "Decreasing"
+                if slope < 0
+                else "No linear change"
+            )
+
+            significance = (
+                "Significant (p < 0.05)"
+                if np.isfinite(pvalue) and pvalue < 0.05
+                else "Not significant (p ≥ 0.05)"
+                if np.isfinite(pvalue)
+                else "Significance unavailable"
+            )
+
+            metric(
+                "Annual rainfall trend",
+                f"{slope:+,.1f} mm/year",
+                f"{direction} · {significance}",
+            )
+        else:
+            st.info("At least 5 valid years are needed for rainfall trends.")
+
+    with t2:
+        if humidity_trend is not None:
+            slope, _, _, tau, pvalue = humidity_trend
+
+            direction = (
+                "Increasing"
+                if slope > 0
+                else "Decreasing"
+                if slope < 0
+                else "No linear change"
+            )
+
+            significance = (
+                "Significant (p < 0.05)"
+                if np.isfinite(pvalue) and pvalue < 0.05
+                else "Not significant (p ≥ 0.05)"
+                if np.isfinite(pvalue)
+                else "Significance unavailable"
+            )
+
+            metric(
+                "Annual humidity trend",
+                f"{slope:+.2f} pp/year",
+                f"{direction} · {significance}",
+            )
+        else:
+            st.info("At least 5 valid years are needed for humidity trends.")
+
+    st.caption(
+        "Trend significance uses Kendall rank correlation. "
+        "It is not a formal Mann–Kendall test. "
+        "Autocorrelation may affect statistical significance."
+    )
     st.subheader("Annual and monsoon rainfall")
 
     rainfall_fig = go.Figure()

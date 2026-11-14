@@ -89,7 +89,7 @@ with st.sidebar:
         "[NASA POWER Monthly API]"
         "(https://power.larc.nasa.gov/docs/services/api/temporal/monthly/)"
     )
-    st.caption("Parameter: T2M · Community: RE")
+    st.caption("Parameters: T2M, PRECTOTCORR, RH2M · Community: RE")
 
 lat, lon = LOCATIONS[place]
 
@@ -184,6 +184,97 @@ def fetch_data(
     return df
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_climate_data(
+    latitude: float,
+    longitude: float,
+    first_year: int,
+    last_year: int,
+) -> pd.DataFrame:
+    """Retrieve monthly precipitation and relative humidity from NASA POWER."""
+    url = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+
+    params = {
+        "parameters": "PRECTOTCORR,RH2M",
+        "community": "RE",
+        "longitude": longitude,
+        "latitude": latitude,
+        "start": first_year,
+        "end": last_year,
+        "format": "JSON",
+    }
+
+    response = requests.get(url, params=params, timeout=45)
+    response.raise_for_status()
+    payload = response.json()
+
+    try:
+        parameters = payload["properties"]["parameter"]
+        precipitation_values = parameters["PRECTOTCORR"]
+        humidity_values = parameters["RH2M"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            "NASA POWER returned an unexpected climate-data response."
+        ) from exc
+
+    if not isinstance(precipitation_values, dict) or not isinstance(
+        humidity_values, dict
+    ):
+        raise TypeError("NASA POWER returned invalid climate datasets.")
+
+    rows = []
+
+    for date_key, precipitation_value in precipitation_values.items():
+        date_token = str(date_key).strip()
+
+        if len(date_token) < 6 or not date_token[:6].isdigit():
+            continue
+
+        month_date = pd.to_datetime(
+            date_token[:6],
+            format="%Y%m",
+            errors="coerce",
+        )
+
+        if pd.isna(month_date):
+            continue
+
+        try:
+            precipitation = float(precipitation_value)
+        except (ValueError, TypeError):
+            precipitation = np.nan
+
+        humidity_value = humidity_values.get(date_key)
+        try:
+            humidity = float(humidity_value) if humidity_value is not None else np.nan
+        except (ValueError, TypeError):
+            humidity = np.nan
+
+        if not np.isfinite(precipitation) or precipitation < 0:
+            precipitation = np.nan
+
+        if not np.isfinite(humidity) or not 0 <= humidity <= 100:
+            humidity = np.nan
+
+        rows.append(
+            {
+                "date": month_date,
+                "precipitation_rate": precipitation,
+                "humidity": humidity,
+            }
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=["date", "precipitation_rate", "humidity"],
+    ).sort_values("date")
+
+    if df.empty:
+        raise ValueError("NASA POWER returned no valid climate observations.")
+
+    return df
+
+
 def calculate_annual(monthly_data: pd.DataFrame) -> pd.DataFrame:
     data: pd.DataFrame = monthly_data.copy()
     data["year"] = data["date"].dt.year
@@ -196,6 +287,70 @@ def calculate_annual(monthly_data: pd.DataFrame) -> pd.DataFrame:
     result: pd.DataFrame = annual_data.loc[annual_data["months_available"] >= 10].copy()
 
     return result
+
+
+def calculate_climate_annual(monthly_data: pd.DataFrame) -> pd.DataFrame:
+    """Calculate annual rainfall, monsoon rainfall and day-weighted humidity."""
+    data = monthly_data.copy()
+
+    data["year"] = data["date"].dt.year
+    data["month"] = data["date"].dt.month
+    data["days_in_month"] = data["date"].dt.days_in_month
+
+    # Convert monthly mean daily precipitation rate into monthly rainfall.
+    data["rainfall_mm"] = data["precipitation_rate"] * data["days_in_month"]
+
+    # Calculate day-weighted humidity.
+    data["weighted_humidity"] = data["humidity"] * data["days_in_month"]
+
+    data["humidity_days"] = data["days_in_month"].where(
+        data["humidity"].notna(),
+        0,
+    )
+
+    annual = data.groupby("year").agg(
+        annual_rainfall=("rainfall_mm", "sum"),
+        rainfall_months=("rainfall_mm", "count"),
+        humidity_weighted_sum=("weighted_humidity", "sum"),
+        humidity_days=("humidity_days", "sum"),
+        humidity_months=("humidity", "count"),
+    )
+
+    annual["annual_humidity"] = (
+        annual["humidity_weighted_sum"]
+        .div(annual["humidity_days"])
+        .where(annual["humidity_days"] > 0)
+    )
+
+    # Require all 12 months for annual rainfall.
+    annual.loc[
+        annual["rainfall_months"] != 12,
+        "annual_rainfall",
+    ] = np.nan
+
+    # Require at least 10 valid months for annual humidity.
+    annual.loc[
+        annual["humidity_months"] < 10,
+        "annual_humidity",
+    ] = np.nan
+
+    # June–September monsoon rainfall.
+    monsoon_data = data.loc[data["month"].between(6, 9)]
+
+    monsoon = monsoon_data.groupby("year").agg(
+        monsoon_rainfall=("rainfall_mm", "sum"),
+        monsoon_months=("rainfall_mm", "count"),
+    )
+
+    annual = annual.join(monsoon, how="left")
+
+    # Require all four monsoon months.
+    annual.loc[
+        annual["monsoon_months"] != 4,
+        "monsoon_rainfall",
+    ] = np.nan
+
+    return annual.reset_index()
 
 
 def calculate_trend(
@@ -490,6 +645,169 @@ st.info(
 )
 
 # ---------------------------------------------------------
+# RAINFALL AND HUMIDITY ANALYSIS
+# ---------------------------------------------------------
+
+st.divider()
+st.header("Rainfall and humidity patterns")
+
+st.caption(
+    "Investigate annual precipitation, monsoon rainfall "
+    "and relative humidity using NASA POWER data."
+)
+
+if refresh:
+    fetch_climate_data.clear()
+
+with st.spinner("Retrieving rainfall and humidity data from NASA POWER…"):
+    try:
+        climate_monthly = fetch_climate_data(
+            lat,
+            lon,
+            start_year,
+            end_year,
+        )
+        climate_annual = calculate_climate_annual(climate_monthly)
+
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+    ) as exc:
+        climate_annual = pd.DataFrame()
+        st.warning(f"Could not retrieve rainfall and humidity data: {exc}")
+
+if not climate_annual.empty:
+    rainfall_data = climate_annual.dropna(subset=["annual_rainfall"])
+    monsoon_data = climate_annual.dropna(subset=["monsoon_rainfall"])
+    humidity_data = climate_annual.dropna(subset=["annual_humidity"])
+
+    latest_rainfall = rainfall_data.iloc[-1] if not rainfall_data.empty else None
+    latest_humidity = humidity_data.iloc[-1] if not humidity_data.empty else None
+
+    r1, r2 = st.columns(2)
+
+    with r1:
+        if latest_rainfall is not None:
+            metric(
+                "Latest annual rainfall",
+                f"{latest_rainfall['annual_rainfall']:,.1f} mm",
+                f"Year {int(latest_rainfall['year'])}",
+            )
+        else:
+            st.info("No complete annual rainfall total is available.")
+
+    with r2:
+        if latest_humidity is not None:
+            metric(
+                "Latest annual mean humidity",
+                f"{latest_humidity['annual_humidity']:.1f}%",
+                f"Year {int(latest_humidity['year'])}",
+            )
+        else:
+            st.info("No annual humidity estimate is available.")
+
+    st.subheader("Annual and monsoon rainfall")
+
+    rainfall_fig = go.Figure()
+
+    if not rainfall_data.empty:
+        rainfall_fig.add_trace(
+            go.Scatter(
+                x=rainfall_data["year"],
+                y=rainfall_data["annual_rainfall"],
+                mode="lines+markers",
+                name="Annual rainfall",
+                line={"color": "#56d6c7", "width": 3},
+                hovertemplate="%{x}: %{y:,.1f} mm<extra></extra>",
+            )
+        )
+
+    if not monsoon_data.empty:
+        rainfall_fig.add_trace(
+            go.Scatter(
+                x=monsoon_data["year"],
+                y=monsoon_data["monsoon_rainfall"],
+                mode="lines+markers",
+                name="June–September rainfall",
+                line={"color": "#f6b85c", "width": 2},
+                hovertemplate="%{x}: %{y:,.1f} mm<extra></extra>",
+            )
+        )
+
+    rainfall_fig.update_layout(
+        template="plotly_dark",
+        height=400,
+        paper_bgcolor="#07111d",
+        plot_bgcolor="#0b1a29",
+        xaxis_title="Year",
+        yaxis_title="Accumulated precipitation (mm)",
+        hovermode="x unified",
+        legend={"orientation": "h", "y": 1.12},
+    )
+
+    rainfall_fig.update_xaxes(
+        gridcolor="#1b3042",
+        range=[start_year, end_year],
+    )
+    rainfall_fig.update_yaxes(gridcolor="#1b3042")
+
+    st.plotly_chart(rainfall_fig, use_container_width=True)
+
+    st.subheader("Annual relative humidity")
+
+    if not humidity_data.empty:
+        humidity_fig = go.Figure(
+            go.Scatter(
+                x=humidity_data["year"],
+                y=humidity_data["annual_humidity"],
+                mode="lines+markers",
+                name="Annual mean humidity",
+                line={"color": "#8fa9ff", "width": 3},
+                hovertemplate="%{x}: %{y:.1f}%<extra></extra>",
+            )
+        )
+
+        humidity_fig.update_layout(
+            template="plotly_dark",
+            height=350,
+            paper_bgcolor="#07111d",
+            plot_bgcolor="#0b1a29",
+            xaxis_title="Year",
+            yaxis_title="Relative humidity (%)",
+        )
+
+        humidity_fig.update_xaxes(
+            gridcolor="#1b3042",
+            range=[start_year, end_year],
+        )
+        humidity_fig.update_yaxes(gridcolor="#1b3042")
+
+        st.plotly_chart(humidity_fig, use_container_width=True)
+    else:
+        st.info("Not enough valid humidity observations to display a trend.")
+
+    with st.expander("View annual rainfall and humidity data"):
+        st.dataframe(
+            climate_annual.style.format(
+                {
+                    "annual_rainfall": "{:,.1f}",
+                    "annual_humidity": "{:.1f}",
+                    "monsoon_rainfall": "{:,.1f}",
+                },
+                na_rep="N/A",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    st.caption(
+        "Annual rainfall requires 12 valid monthly observations. "
+        "Monsoon rainfall requires all four June–September observations. "
+        "Humidity requires at least 10 valid months."
+    )
+
+# ---------------------------------------------------------
 # INTERACTIVE INDIA MAP
 # ---------------------------------------------------------
 
@@ -707,6 +1025,18 @@ Autocorrelation and changes in observing/model systems can affect
 significance. Statistical association does not establish a cause
 of warming or cooling. NASA POWER gridded/model-derived values are
 not a substitute for a local weather station.
+
+**Rainfall:** Monthly mean daily precipitation rate (`PRECTOTCORR`)
+is multiplied by the number of calendar days in each month to estimate
+monthly accumulated rainfall. Annual totals are reported only when
+all 12 months are valid.
+
+**Monsoon rainfall:** June–September precipitation is accumulated
+for each year. Years missing any of the four monsoon months are excluded.
+
+**Relative humidity:** Monthly mean relative humidity at 2 metres
+(`RH2M`) is averaged into annual means. Years with fewer than 10
+valid months are excluded.
 """
     )
 

@@ -1,11 +1,15 @@
-import requests
-import pandas as pd
 import numpy as np
+import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-from scipy.stats import linregress, kendalltau
+from scipy.stats import kendalltau
 
-st.set_page_config(page_title="MonsoonLens | Earth Trend Detective", page_icon="🌏", layout="wide")
+st.set_page_config(
+    page_title="MonsoonLens | Earth Trend Detective",
+    page_icon="🌏",
+    layout="wide",
+)
 
 LOCATIONS = {
     "Kochi, Kerala": (9.9312, 76.2673),
@@ -16,7 +20,8 @@ LOCATIONS = {
     "New Delhi": (28.6139, 77.2090),
 }
 
-st.markdown("""
+st.markdown(
+    """
 <style>
 .stApp {background: #07111d; color: #e8f1fa;}
 [data-testid="stHeader"] {background: rgba(0,0,0,0);}
@@ -30,31 +35,79 @@ h1,h2,h3 {color:#edf6ff;}
 .metric-note {color:#83a0b5;font-size:.78rem;margin-top:3px;}
 section[data-testid="stSidebar"] {background:#0a1826;}
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
-st.markdown('<div class="eyebrow">EARTH SYSTEM TREND DETECTIVE · NASA POWER</div>', unsafe_allow_html=True)
+st.markdown(
+    '<div class="eyebrow">EARTH SYSTEM TREND DETECTIVE · NASA POWER</div>',
+    unsafe_allow_html=True,
+)
 st.title("🌏 MonsoonLens")
-st.markdown('<p class="subtle">Investigating long-term temperature patterns across India using NASA Earth observation and model data.</p>', unsafe_allow_html=True)
+st.markdown(
+    '<p class="subtle">Investigating long-term temperature patterns '
+    "across India using NASA Earth observation and model data.</p>",
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
     st.markdown("## Investigation")
-    place = st.selectbox("Study location", list(LOCATIONS.keys()))
-    start_year = st.selectbox("Start year", [2001, 2005, 2010], index=0)
-    end_year = st.selectbox("End year", [2023, 2024, 2025], index=2)
-    refresh = st.button("↻ Refresh NASA data", use_container_width=True)
+
+    place = st.selectbox(
+        "Study location",
+        list(LOCATIONS.keys()),
+    )
+
+    compare_places = st.multiselect(
+        "Compare locations (up to 3)",
+        options=list(LOCATIONS.keys()),
+        default=[place],
+        max_selections=3,
+        help="Choose up to three locations for a side-by-side comparison.",
+    )
+
+    start_year = st.selectbox(
+        "Start year",
+        [2001, 2005, 2010],
+        index=0,
+    )
+
+    end_year = st.selectbox(
+        "End year",
+        [2023, 2024, 2025],
+        index=2,
+    )
+
+    refresh = st.button(
+        "↻ Refresh NASA data",
+        use_container_width=True,
+    )
+
     st.divider()
     st.caption("DATA SOURCE")
-    st.markdown("[NASA POWER Monthly API](https://power.larc.nasa.gov/docs/services/api/temporal/monthly/)")
+    st.markdown(
+        "[NASA POWER Monthly API]"
+        "(https://power.larc.nasa.gov/docs/services/api/temporal/monthly/)"
+    )
     st.caption("Parameter: T2M · Community: RE")
 
 lat, lon = LOCATIONS[place]
+
 if start_year >= end_year:
     st.error("End year must be later than start year.")
     st.stop()
 
+
 @st.cache_data(ttl=3600, show_spinner=False)
-def fetch_data(latitude, longitude, first_year, last_year):
+def fetch_data(
+    latitude: float,
+    longitude: float,
+    first_year: int,
+    last_year: int,
+) -> pd.DataFrame:
+    """Retrieve and validate monthly temperature observations from NASA POWER."""
     url = "https://power.larc.nasa.gov/api/temporal/monthly/point"
+
     params = {
         "parameters": "T2M",
         "community": "RE",
@@ -64,137 +117,578 @@ def fetch_data(latitude, longitude, first_year, last_year):
         "end": last_year,
         "format": "JSON",
     }
-    response = requests.get(url, params=params, timeout=45)
+
+    response = requests.get(
+        url,
+        params=params,
+        timeout=45,
+    )
     response.raise_for_status()
+
     payload = response.json()
-    values = payload["properties"]["parameter"]["T2M"]
+
+    try:
+        values = payload["properties"]["parameter"]["T2M"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError(
+            "NASA POWER returned an unexpected response structure."
+        ) from exc
+
+    if not isinstance(values, dict):
+        raise TypeError("NASA POWER returned an invalid temperature dataset.")
+
     rows = []
+
     for date_key, value in values.items():
-        if value is None or float(value) <= -900:
+        if value is None:
             continue
-        # NASA POWER date keys may include a trailing day/metadata digit.
-        # Monthly records are identified by the first six YYYYMM digits.
+
+        try:
+            temperature = float(value)
+        except (ValueError, TypeError):
+            continue
+
+        if not np.isfinite(temperature) or temperature <= -900:
+            continue
+
+        # Monthly records are identified by their first six YYYYMM digits.
         date_token = str(date_key).strip()
+
         if len(date_token) < 6 or not date_token[:6].isdigit():
             continue
-        month_date = pd.to_datetime(date_token[:6], format="%Y%m", errors="coerce")
+
+        month_date = pd.to_datetime(
+            date_token[:6],
+            format="%Y%m",
+            errors="coerce",
+        )
+
         if pd.isna(month_date):
             continue
-        rows.append({"date": month_date, "temperature": float(value)})
-    df = pd.DataFrame(rows).sort_values("date")
+
+        rows.append(
+            {
+                "date": month_date,
+                "temperature": temperature,
+            }
+        )
+
+    df = pd.DataFrame(
+        rows,
+        columns=["date", "temperature"],
+    ).sort_values("date")
+
     if df.empty:
         raise ValueError("NASA POWER returned no valid observations for this request.")
+
     return df
+
+
+def calculate_annual(monthly_data: pd.DataFrame) -> pd.DataFrame:
+    data: pd.DataFrame = monthly_data.copy()
+    data["year"] = data["date"].dt.year
+
+    annual_data: pd.DataFrame = data.groupby("year", as_index=False).agg(
+        annual_mean=("temperature", "mean"),
+        months_available=("temperature", "count"),
+    )
+
+    result: pd.DataFrame = annual_data.loc[annual_data["months_available"] >= 10].copy()
+
+    return result
+
+
+def calculate_trend(
+    years: np.ndarray,
+    temperatures: np.ndarray,
+) -> tuple[float, float, float, float, float]:
+    """
+    Calculate linear trend, R-squared and Kendall rank statistics.
+
+    Returns:
+        slope, intercept, r_squared, kendall_tau, p_value
+    """
+    if len(years) < 5 or len(temperatures) < 5:
+        raise ValueError("At least five annual observations are required.")
+
+    # NumPy ordinary least-squares regression.
+    coefficients = np.polyfit(
+        years,
+        temperatures,
+        1,
+    )
+
+    slope_value = float(coefficients[0])
+    intercept_value = float(coefficients[1])
+
+    # Calculate R-squared using Pearson correlation.
+    correlation_matrix = np.corrcoef(
+        years,
+        temperatures,
+    )
+
+    correlation = float(correlation_matrix[0, 1])
+    r_squared = correlation**2
+
+    # Kendall rank correlation and its p-value.
+    tau_result, pvalue_result = kendalltau(
+        years,
+        temperatures,
+        nan_policy="omit",
+    )
+
+    tau_value = float(tau_result)
+    pvalue = float(pvalue_result) if np.isfinite(pvalue_result) else np.nan
+
+    return (
+        slope_value,
+        intercept_value,
+        r_squared,
+        tau_value,
+        pvalue,
+    )
+
+
+def metric(
+    label: str,
+    value: str,
+    note: str,
+) -> None:
+    """Render a dashboard metric card."""
+    st.markdown(
+        f'<div class="metric-card">'
+        f'<div class="metric-label">{label}</div>'
+        f'<div class="metric-value">{value}</div>'
+        f'<div class="metric-note">{note}</div>'
+        f"</div>",
+        unsafe_allow_html=True,
+    )
+
+
+# ---------------------------------------------------------
+# MAIN LOCATION DATA
+# ---------------------------------------------------------
 
 if refresh:
     fetch_data.clear()
 
 with st.spinner("Retrieving monthly observations from NASA POWER…"):
     try:
-        monthly = fetch_data(lat, lon, start_year, end_year)
-    except Exception as exc:
+        monthly = fetch_data(
+            lat,
+            lon,
+            start_year,
+            end_year,
+        )
+    except (
+        requests.RequestException,
+        ValueError,
+        TypeError,
+    ) as exc:
         st.error(f"Could not retrieve NASA POWER data: {exc}")
-        st.info("Check your internet connection and try refreshing. NASA POWER may occasionally be unavailable.")
+        st.info(
+            "Check your internet connection and try refreshing. "
+            "NASA POWER may occasionally be unavailable."
+        )
         st.stop()
 
-monthly["year"] = monthly["date"].dt.year
-annual = monthly.groupby("year", as_index=False).agg(
-    annual_mean=("temperature", "mean"),
-    months_available=("temperature", "count")
-)
-annual = annual[annual["months_available"] >= 10].copy()
+annual = calculate_annual(monthly)
+
 if len(annual) < 5:
     st.error("Not enough complete annual observations to estimate a reliable trend.")
     st.stop()
 
-x = annual["year"].to_numpy(dtype=float)
-y = annual["annual_mean"].to_numpy(dtype=float)
-fit = linregress(x, y)
-tau = kendalltau(x, y, nan_policy="omit")
-slope_decade = fit.slope * 10
-change = y[-1] - y[0]
-latest_year = int(annual.iloc[-1]["year"])
-latest_temp = float(annual.iloc[-1]["annual_mean"])
-pvalue = float(tau.pvalue) if np.isfinite(tau.pvalue) else np.nan
-significant = bool(pvalue < 0.05) if np.isfinite(pvalue) else False
+x = np.asarray(
+    annual["year"],
+    dtype=np.float64,
+)
 
-def metric(label, value, note):
-    st.markdown(f'<div class="metric-card"><div class="metric-label">{label}</div><div class="metric-value">{value}</div><div class="metric-note">{note}</div></div>', unsafe_allow_html=True)
+y = np.asarray(
+    annual["annual_mean"],
+    dtype=np.float64,
+)
+
+(
+    slope,
+    intercept,
+    r_squared,
+    tau_statistic,
+    pvalue,
+) = calculate_trend(x, y)
+
+slope_decade = slope * 10.0
+change = float(y[-1] - y[0])
+
+latest_year = int(x[-1])
+latest_temp = float(y[-1])
+
+significant = bool(np.isfinite(pvalue) and pvalue < 0.05)
+
+# ---------------------------------------------------------
+# MAIN DASHBOARD METRICS
+# ---------------------------------------------------------
 
 m1, m2, m3, m4 = st.columns(4)
-with m1: metric("Latest annual mean", f"{latest_temp:.2f} °C", f"Calendar year {latest_year}")
-with m2: metric("Observed change", f"{change:+.2f} °C", f"{int(x[0])}–{latest_year}; first vs last year")
-with m3: metric("Linear trend rate", f"{slope_decade:+.3f} °C", "per decade · least-squares slope")
-with m4: metric("Kendall trend p-value", f"{pvalue:.4f}" if np.isfinite(pvalue) else "N/A", "Significant at 0.05" if significant else "Not significant at 0.05")
+
+with m1:
+    metric(
+        "Latest annual mean",
+        f"{latest_temp:.2f} °C",
+        f"Calendar year {latest_year}",
+    )
+
+with m2:
+    metric(
+        "Observed change",
+        f"{change:+.2f} °C",
+        f"{int(x[0])}–{latest_year}; first vs last year",
+    )
+
+with m3:
+    metric(
+        "Linear trend rate",
+        f"{slope_decade:+.3f} °C",
+        "per decade · least-squares slope",
+    )
+
+with m4:
+    metric(
+        "Kendall trend p-value",
+        f"{pvalue:.4f}" if np.isfinite(pvalue) else "N/A",
+        "Significant at 0.05" if significant else "Not significant at 0.05",
+    )
 
 st.markdown("")
-left, right = st.columns([2.2, 1], gap="large")
+
+left, right = st.columns(
+    [2.2, 1],
+    gap="large",
+)
+
 with left:
     st.subheader("Annual temperature trend")
+
     fig = go.Figure()
-    fig.add_trace(go.Scatter(
-        x=annual["year"], y=annual["annual_mean"], mode="lines+markers",
-        name="Annual mean", line=dict(color="#56d6c7", width=3),
-        marker=dict(size=6), hovertemplate="%{x}: %{y:.2f} °C<extra></extra>"
-    ))
-    fig.add_trace(go.Scatter(
-        x=annual["year"], y=fit.intercept + fit.slope*x, mode="lines",
-        name="Linear trend", line=dict(color="#f6b85c", width=2, dash="dash"),
-        hovertemplate="Trend: %{y:.2f} °C<extra></extra>"
-    ))
-    fig.update_layout(
-        template="plotly_dark", height=390, margin=dict(l=10,r=10,t=20,b=10),
-        paper_bgcolor="#07111d", plot_bgcolor="#0b1a29",
-        xaxis_title="Year", yaxis_title="Annual mean 2 m air temperature (°C)",
-        legend=dict(orientation="h", y=1.12), hovermode="x unified"
+
+    fig.add_trace(
+        go.Scatter(
+            x=annual["year"],
+            y=annual["annual_mean"],
+            mode="lines+markers",
+            name="Annual mean",
+            line={"color": "#56d6c7", "width": 3},
+            marker={"size": 6},
+            hovertemplate="%{x}: %{y:.2f} °C<extra></extra>",
+        )
     )
-    fig.update_xaxes(gridcolor="#1b3042")
-    fig.update_yaxes(gridcolor="#1b3042")
-    st.plotly_chart(fig, use_container_width=True)
+
+    fig.add_trace(
+        go.Scatter(
+            x=annual["year"],
+            y=intercept + slope * x,
+            mode="lines",
+            name="Linear trend",
+            line={
+                "color": "#f6b85c",
+                "width": 2,
+                "dash": "dash",
+            },
+            hovertemplate="Trend: %{y:.2f} °C<extra></extra>",
+        )
+    )
+
+    fig.update_layout(
+        template="plotly_dark",
+        height=390,
+        margin={"l": 10, "r": 10, "t": 20, "b": 10},
+        paper_bgcolor="#07111d",
+        plot_bgcolor="#0b1a29",
+        xaxis_title="Year",
+        yaxis_title="Annual mean 2 m air temperature (°C)",
+        legend={"orientation": "h", "y": 1.12},
+        hovermode="x unified",
+    )
+
+    fig.update_xaxes(
+        gridcolor="#1b3042",
+        range=[start_year, end_year],
+    )
+
+    fig.update_yaxes(
+        gridcolor="#1b3042",
+    )
+
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+    )
 
 with right:
     st.subheader("Trend assessment")
+
     if significant:
         st.success("Statistically significant monotonic trend detected (p < 0.05).")
     else:
         st.warning("No statistically significant monotonic trend detected at p < 0.05.")
-    direction = "upward" if slope_decade > 0 else "downward" if slope_decade < 0 else "approximately flat"
+
+    direction = (
+        "upward"
+        if slope_decade > 0
+        else "downward"
+        if slope_decade < 0
+        else "approximately flat"
+    )
+
     st.markdown(f"**Direction:** {direction.title()}")
-    st.markdown(f"**Kendall's τ:** {tau.statistic:.3f}")
-    st.markdown(f"**Regression R²:** {fit.rvalue**2:.3f}")
+    st.markdown(f"**Kendall's τ:** {tau_statistic:.3f}")
+    st.markdown(f"**Regression R²:** {r_squared:.3f}")
     st.markdown(f"**Observations:** {len(annual)} annual means")
     st.markdown(f"**Coverage:** {int(x[0])}–{latest_year}")
-    st.caption("The p-value tests evidence for a monotonic association over time. It does not establish causation.")
+
+    st.caption(
+        "The p-value tests evidence for a monotonic association over time. "
+        "It does not establish causation."
+    )
+
+
+# ---------------------------------------------------------
+# AUTOMATIC INTERPRETATION
+# ---------------------------------------------------------
 
 st.subheader("What does the data suggest?")
+
 if significant:
-    significance_text = "Kendall's rank test indicates a statistically significant monotonic association with time in this series."
+    significance_text = (
+        "Kendall's rank test indicates a statistically significant "
+        "monotonic association with time in this series."
+    )
 else:
-    significance_text = "Kendall's rank test does not find sufficient evidence of a monotonic association with time at the 5% significance level."
+    significance_text = (
+        "Kendall's rank test does not find sufficient evidence of a "
+        "monotonic association with time at the 5% significance level."
+    )
+
 if slope_decade > 0:
-    direction_text = f"The fitted linear trend is upward at approximately {slope_decade:.3f} °C per decade."
+    direction_text = (
+        f"The fitted linear trend is upward at approximately "
+        f"{slope_decade:.3f} °C per decade."
+    )
 elif slope_decade < 0:
-    direction_text = f"The fitted linear trend is downward at approximately {abs(slope_decade):.3f} °C per decade."
+    direction_text = (
+        f"The fitted linear trend is downward at approximately "
+        f"{abs(slope_decade):.3f} °C per decade."
+    )
 else:
     direction_text = "The fitted linear trend is approximately flat."
-st.info(f"For {place}, the annual mean 2 m air temperature changed by {change:+.2f} °C between the first and last available years. {direction_text} {significance_text} This is a point-based analysis and should not be interpreted as a complete regional climate assessment.")
+
+st.info(
+    f"For {place}, the annual mean 2 m air temperature changed by "
+    f"{change:+.2f} °C between the first and last available years. "
+    f"{direction_text} {significance_text} "
+    "This is a point-based analysis and should not be interpreted "
+    "as a complete regional climate assessment."
+)
+
+
+# ---------------------------------------------------------
+# METHODOLOGY
+# ---------------------------------------------------------
 
 with st.expander("Methodology, limitations & data provenance"):
-    st.markdown("""
-    **Data:** NASA POWER Monthly Point API, parameter `T2M` (temperature at 2 metres), community `RE`. The meteorological data in NASA POWER are derived from the MERRA-2 assimilation system.
+    st.markdown(
+        """
+**Data:** NASA POWER Monthly Point API, parameter `T2M`
+(temperature at 2 metres), community `RE`. The meteorological data
+in NASA POWER are derived from the MERRA-2 assimilation system.
 
-    **Processing:** Monthly means are averaged into calendar-year means. Years with fewer than 10 valid monthly observations are excluded.
+**Processing:** Monthly means are averaged into calendar-year means.
+Years with fewer than 10 valid monthly observations are excluded.
 
-    **Linear trend:** Ordinary least-squares regression of annual mean temperature against calendar year. The slope is multiplied by 10 to express °C per decade.
+**Linear trend:** Ordinary least-squares regression of annual mean
+temperature against calendar year. The slope is multiplied by 10
+to express °C per decade.
 
-    **Monotonic trend check:** Kendall's rank correlation between year and annual mean temperature is used as a non-parametric association test. The p-value threshold is 0.05.
+**Monotonic trend check:** Kendall's rank correlation between year
+and annual mean temperature is used as a non-parametric association
+test. The p-value threshold is 0.05.
 
-    **Limitations:** This is a single coordinate, not a city-wide measurement. Annual averaging can hide seasonal extremes. Autocorrelation and changes in observing/model systems can affect significance. Statistical association does not establish a cause of warming or cooling. NASA POWER gridded/model-derived values are not a substitute for a local weather station.
-    """)
-st.caption("Source: NASA POWER · Data accessed live by this application · Built for the Earth System Trend Detective challenge")
+**Limitations:** This is a single coordinate, not a city-wide
+measurement. Annual averaging can hide seasonal extremes.
+Autocorrelation and changes in observing/model systems can affect
+significance. Statistical association does not establish a cause
+of warming or cooling. NASA POWER gridded/model-derived values are
+not a substitute for a local weather station.
+"""
+    )
+
+st.caption(
+    "Source: NASA POWER · Data accessed live by this application · "
+    "Built for the Earth System Trend Detective challenge"
+)
+
 st.download_button(
     "Download annual results (CSV)",
     data=annual.to_csv(index=False).encode("utf-8"),
     file_name="monsoonlens_annual_temperature.csv",
-    mime="text/csv"
+    mime="text/csv",
 )
+
+
+# ---------------------------------------------------------
+# MULTI-LOCATION COMPARISON
+# ---------------------------------------------------------
+
+st.divider()
+st.subheader("Compare locations")
+
+st.caption("Compare annual temperature patterns over the same period.")
+
+if not compare_places:
+    st.info("Select at least one location in the sidebar.")
+
+else:
+    comparison_series = []
+    comparison_rows = []
+
+    for comparison_place in compare_places:
+        comparison_lat, comparison_lon = LOCATIONS[comparison_place]
+
+        try:
+            comparison_monthly = fetch_data(
+                comparison_lat,
+                comparison_lon,
+                start_year,
+                end_year,
+            )
+
+            yearly = calculate_annual(comparison_monthly)
+
+            if len(yearly) < 5:
+                st.warning(f"Not enough annual observations for {comparison_place}.")
+                continue
+
+            x_values = np.asarray(
+                yearly["year"],
+                dtype=np.float64,
+            )
+
+            y_values = np.asarray(
+                yearly["annual_mean"],
+                dtype=np.float64,
+            )
+
+            (
+                comparison_slope,
+                _,
+                _,
+                _,
+                comparison_pvalue,
+            ) = calculate_trend(
+                x_values,
+                y_values,
+            )
+
+            yearly["location"] = comparison_place
+            comparison_series.append(yearly)
+
+            comparison_rows.append(
+                {
+                    "Location": comparison_place,
+                    "Trend (°C/decade)": comparison_slope * 10.0,
+                    "Observed change (°C)": float(y_values[-1] - y_values[0]),
+                    "Latest mean (°C)": float(y_values[-1]),
+                    "Kendall p-value": comparison_pvalue,
+                    "Coverage": (f"{int(x_values[0])}–{int(x_values[-1])}"),
+                }
+            )
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+        ) as exc:
+            st.warning(f"Could not analyse {comparison_place}: {exc}")
+
+    if comparison_series:
+        comparison_data = pd.concat(
+            comparison_series,
+            ignore_index=True,
+        )
+
+        comparison_fig = go.Figure()
+
+        for comparison_place in compare_places:
+            location_data = comparison_data[
+                comparison_data["location"] == comparison_place
+            ]
+
+            if location_data.empty:
+                continue
+
+            comparison_fig.add_trace(
+                go.Scatter(
+                    x=location_data["year"],
+                    y=location_data["annual_mean"],
+                    mode="lines+markers",
+                    name=comparison_place,
+                    hovertemplate=(
+                        comparison_place
+                        + "<br>Year: %{x}"
+                        + "<br>Temperature: %{y:.2f} °C"
+                        + "<extra></extra>"
+                    ),
+                )
+            )
+
+        comparison_fig.update_layout(
+            template="plotly_dark",
+            height=430,
+            paper_bgcolor="#07111d",
+            plot_bgcolor="#0b1a29",
+            xaxis_title="Year",
+            yaxis_title="Annual mean temperature (°C)",
+            hovermode="x unified",
+        )
+
+        comparison_fig.update_xaxes(
+            gridcolor="#1b3042",
+            range=[start_year, end_year],
+        )
+
+        comparison_fig.update_yaxes(
+            gridcolor="#1b3042",
+        )
+
+        st.plotly_chart(
+            comparison_fig,
+            use_container_width=True,
+        )
+
+        st.subheader("Location statistics")
+
+        comparison_table = pd.DataFrame(comparison_rows)
+
+        st.dataframe(
+            comparison_table.style.format(
+                {
+                    "Trend (°C/decade)": "{:+.3f}",
+                    "Observed change (°C)": "{:+.2f}",
+                    "Latest mean (°C)": "{:.2f}",
+                    "Kendall p-value": "{:.4f}",
+                },
+                na_rep="N/A",
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.caption(
+            "Each location is analysed independently. The Kendall "
+            "p-value measures rank association with time; it does "
+            "not establish causation. Compare trends as well as "
+            "absolute temperatures."
+        )
+    else:
+        st.warning(
+            "No locations had enough valid annual observations to display a comparison."
+        )

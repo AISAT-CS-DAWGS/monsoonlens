@@ -489,6 +489,195 @@ st.info(
     "as a complete regional climate assessment."
 )
 
+# ---------------------------------------------------------
+# INTERACTIVE INDIA MAP
+# ---------------------------------------------------------
+
+st.divider()
+st.subheader("Explore temperature trends across India")
+
+st.caption(
+    "Explore the study locations geographically. "
+    "Hover over a marker to inspect its latest annual mean "
+    "and estimated temperature trend."
+)
+
+map_names: list[str] = []
+map_lats: list[float] = []
+map_lons: list[float] = []
+map_customdata: list[list[str | int | float]] = []
+
+with st.spinner("Preparing location data for the India map…"):
+    for map_place, (map_lat, map_lon) in LOCATIONS.items():
+        try:
+            map_monthly = fetch_data(
+                map_lat,
+                map_lon,
+                start_year,
+                end_year,
+            )
+
+            map_annual = calculate_annual(map_monthly)
+
+            if len(map_annual) < 5:
+                continue
+
+            map_years = np.asarray(
+                map_annual["year"],
+                dtype=np.float64,
+            )
+
+            map_temperatures = np.asarray(
+                map_annual["annual_mean"],
+                dtype=np.float64,
+            )
+
+            (
+                map_slope,
+                _,
+                _,
+                _,
+                _,
+            ) = calculate_trend(
+                map_years,
+                map_temperatures,
+            )
+
+            map_names.append(map_place)
+            map_lats.append(map_lat)
+            map_lons.append(map_lon)
+
+            map_customdata.append(
+                [
+                    int(map_years[-1]),
+                    float(map_temperatures[-1]),
+                    float(map_slope * 10.0),
+                ]
+            )
+
+        except (
+            requests.RequestException,
+            ValueError,
+            TypeError,
+        ) as exc:
+            st.warning(f"Could not load map data for {map_place}: {exc}")
+
+if map_names:
+    marker_colors = [
+        "#f6b85c"
+        if name == place
+        else "#56d6c7"
+        if name in compare_places
+        else "#7890a4"
+        for name in map_names
+    ]
+
+    marker_sizes = [
+        19 if name == place else 15 if name in compare_places else 12
+        for name in map_names
+    ]
+
+    india_map = go.Figure(
+        go.Scattergeo(
+            lon=map_lons,
+            lat=map_lats,
+            text=map_names,
+            customdata=map_customdata,
+            mode="markers+text",
+            textposition="top center",
+            textfont={
+                "color": "#e8f1fa",
+                "size": 11,
+            },
+            marker={
+                "size": marker_sizes,
+                "color": marker_colors,
+                "opacity": 0.95,
+                "line": {
+                    "color": "#edf6ff",
+                    "width": 1,
+                },
+            },
+            hovertemplate=(
+                "<b>%{text}</b><br>"
+                "Latest year: %{customdata[0]}<br>"
+                "Annual mean: %{customdata[1]:.2f} °C<br>"
+                "Trend: %{customdata[2]:+.3f} °C/decade"
+                "<extra></extra>"
+            ),
+        )
+    )
+
+    india_map.update_layout(
+        template="plotly_dark",
+        height=620,
+        margin={
+            "l": 5,
+            "r": 5,
+            "t": 10,
+            "b": 10,
+        },
+        paper_bgcolor="#07111d",
+        geo={
+            "scope": "asia",
+            "projection": {
+                "type": "mercator",
+                "scale": 3.0,
+            },
+            "center": {
+                "lat": 20.5,
+                "lon": 79.0,
+            },
+            "lataxis": {
+                "range": [5, 36],
+            },
+            "lonaxis": {
+                "range": [65, 98],
+            },
+            "showland": True,
+            "landcolor": "#102337",
+            "showocean": True,
+            "oceancolor": "#07111d",
+            "showcountries": True,
+            "countrycolor": "#476176",
+            "showcoastlines": True,
+            "coastlinecolor": "#476176",
+            "bgcolor": "#07111d",
+        },
+        showlegend=False,
+    )
+
+    st.plotly_chart(
+        india_map,
+        use_container_width=True,
+        config={
+            "scrollZoom": True,
+            "displayModeBar": True,
+        },
+    )
+
+    st.markdown(
+        """
+        <span style="color:#f6b85c">●</span> Selected study location
+        &nbsp;&nbsp;
+        <span style="color:#56d6c7">●</span> Comparison locations
+        &nbsp;&nbsp;
+        <span style="color:#7890a4">●</span> Other locations
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.caption(
+        "Marker colours identify selection status, not temperature. "
+        "Use the sidebar to change the selected study and comparison locations."
+    )
+
+else:
+    st.warning(
+        "The map could not be populated because no locations "
+        "had enough valid annual observations."
+    )
+
 
 # ---------------------------------------------------------
 # METHODOLOGY
